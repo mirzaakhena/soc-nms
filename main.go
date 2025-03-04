@@ -1,15 +1,17 @@
 package main
 
 import (
+	"database/sql"
 	"fmt"
+	"log"
 	"net"
-	"os"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/go-ping/ping"
 	gosnmp "github.com/gosnmp/gosnmp"
-	"gopkg.in/yaml.v3"
+	_ "github.com/mattn/go-sqlite3"
+	probing "github.com/prometheus-community/pro-bing"
 )
 
 type Device struct {
@@ -28,16 +30,6 @@ type SNMPConfig struct {
     Community string `yaml:"community"`
     Version   int    `yaml:"version"` // 1 = v2c, 3 = v3
     Port      int    `yaml:"port"`
-}
-
-func loadConfig(filename string) (Config, error) {
-    var config Config
-    data, err := os.ReadFile(filename)
-    if err != nil {
-        return config, err
-    }
-    err = yaml.Unmarshal(data, &config)
-    return config, err
 }
 
 func getIPsFromCIDR(cidr string) ([]string, error) {
@@ -62,15 +54,72 @@ func inc(ip net.IP) {
     }
 }
 
-func checkICMP(ip string) bool {
-    pinger, err := ping.NewPinger(ip)
+func initializeDatabase(dbPath string) (*sql.DB, error) {
+    db, err := sql.Open("sqlite3", dbPath)
     if err != nil {
+        return nil, err
+    }
+
+    // Membuat tabel jika belum ada
+    query := `
+    CREATE TABLE IF NOT EXISTS devices (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ip_address TEXT NOT NULL UNIQUE,
+        hostname TEXT,
+        status TEXT,
+        last_updated DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+    
+    CREATE TABLE IF NOT EXISTS topology (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        local_device_ip TEXT NOT NULL,
+        remote_device_ip TEXT NOT NULL,
+        local_port TEXT,
+        remote_port TEXT,
+        last_updated DATETIME DEFAULT CURRENT_TIMESTAMP
+    );    
+    `
+    _, err = db.Exec(query)
+    if err != nil {
+        return nil, err
+    }
+
+    return db, nil
+}
+
+func saveDeviceToDB(db *sql.DB, device Device) error {
+    query := `
+    INSERT INTO devices (ip_address, hostname, status, last_updated)
+    VALUES (?, ?, ?, datetime('now'))
+    ON CONFLICT(ip_address) DO UPDATE SET
+        hostname = excluded.hostname,
+        status = excluded.status,
+        last_updated = excluded.last_updated;
+    `
+    _, err := db.Exec(query, device.IP, device.Hostname, device.Status)
+    return err
+}
+
+func checkICMP(ip string) bool {
+    pinger, err := probing.NewPinger(ip)
+    if err != nil {
+        log.Printf("Failed to create pinger for %s: %v", ip, err)
         return false
     }
-    pinger.Count = 1
+
+    // Set timeout and count
     pinger.Timeout = 2 * time.Second
+    pinger.Count = 1
+
+    // Run the ping
     err = pinger.Run()
-    return err == nil && pinger.Statistics().PacketsRecv > 0
+    if err != nil {
+        log.Printf("Ping failed for %s: %v", ip, err)
+        return false
+    }
+
+    stats := pinger.Statistics()
+    return stats.PacketsRecv > 0
 }
 
 func checkSNMP(ip, community string, version, port int) (string, error) {
@@ -96,11 +145,8 @@ func checkSNMP(ip, community string, version, port int) (string, error) {
     return string(result.Variables[0].Value.([]byte)), nil
 }
 
-func discoverDevices(config Config) []Device {
-    var devices []Device
+func discoverDevices(config Config, db *sql.DB) {
     var wg sync.WaitGroup
-
-    deviceChan := make(chan Device)
 
     for _, network := range config.Networks {
         ips, err := getIPsFromCIDR(network)
@@ -119,41 +165,144 @@ func discoverDevices(config Config) []Device {
                     if hostname, err := checkSNMP(ip, config.SNMP.Community, config.SNMP.Version, config.SNMP.Port); err == nil {
                         device.Hostname = hostname
                     }
+
+                    // Ambil informasi LLDP jika perangkat mendukung
+                    lldpData, err := getLLDPInfo(ip, config.SNMP.Community, config.SNMP.Version, config.SNMP.Port)
+                    if err == nil {
+                        saveTopologyToDB(db, ip, lldpData["remoteSystemName"], "", lldpData["remotePortDesc"])
+                    }
                 }
-                deviceChan <- device
+
+                // Simpan perangkat ke database
+                if err := saveDeviceToDB(db, device); err != nil {
+                    log.Printf("Error saving device %s to DB: %v", ip, err)
+                }
             }(ip)
         }
     }
 
-    go func() {
-        wg.Wait()
-        close(deviceChan)
-    }()
-
-    for dev := range deviceChan {
-        devices = append(devices, dev)
-    }
-
-    return devices
+    wg.Wait()
 }
 
 func main() {
-    config, err := loadConfig("config.yml")
+    // Inisialisasi database
+    db, err := initializeDatabase("devices.db")
     if err != nil {
-        panic(err)
+        log.Fatalf("Failed to initialize database: %v", err)
+    }
+    defer db.Close()
+
+    // Konfigurasi jaringan (contoh statis, bisa diganti dengan loadConfig)
+    config := Config{
+        Networks: []string{"192.168.1.0/24"},
+        SNMP: SNMPConfig{
+            Community: "public",
+            Version:   1, // SNMPv2c
+            Port:      161,
+        },
+        PollInterval: 60, // Detik
     }
 
+    // Polling berkala
     ticker := time.NewTicker(time.Duration(config.PollInterval) * time.Second)
     defer ticker.Stop()
 
     for {
         select {
         case <-ticker.C:
-            devices := discoverDevices(config)
-            fmt.Printf("Discovered %d devices:\n", len(devices))
-            for _, dev := range devices {
-                fmt.Printf("- IP: %-15s Status: %-4s Hostname: %s\n", dev.IP, dev.Status, dev.Hostname)
-            }
+            discoverDevices(config, db)
+            fmt.Println("Discovery completed and saved to database.")
         }
     }
+}
+
+func saveTopologyToDB(db *sql.DB, localIP, remoteIP, localPort, remotePort string) error {
+    query := `
+    INSERT INTO topology (local_device_ip, remote_device_ip, local_port, remote_port, last_updated)
+    VALUES (?, ?, ?, ?, datetime('now'))
+    ON CONFLICT(local_device_ip, remote_device_ip) DO UPDATE SET
+        local_port = excluded.local_port,
+        remote_port = excluded.remote_port,
+        last_updated = excluded.last_updated;
+    `
+    _, err := db.Exec(query, localIP, remoteIP, localPort, remotePort)
+    return err
+}
+
+func getLLDPInfo(ip, community string, version, port int) (map[string]string, error) {
+    snmp := gosnmp.GoSNMP{
+        Target:    ip,
+        Port:      uint16(port),
+        Community: community,
+        Version:   gosnmp.SnmpVersion(version),
+        Timeout:   2 * time.Second,
+    }
+
+    err := snmp.Connect()
+    if err != nil {
+        return nil, err
+    }
+    defer snmp.Conn.Close()
+
+    // Ambil OID lldpRemSysName dan lldpRemPortDesc
+    oids := []string{"1.0.8802.1.1.2.1.4.1.1.5", "1.0.8802.1.1.2.1.4.1.1.8"}
+    result, err := snmp.Get(oids)
+    if err != nil {
+        return nil, err
+    }
+
+    lldpData := make(map[string]string)
+    for _, variable := range result.Variables {
+        switch variable.Name {
+        case "1.0.8802.1.1.2.1.4.1.1.5":
+            lldpData["remoteSystemName"] = string(variable.Value.([]byte))
+        case "1.0.8802.1.1.2.1.4.1.1.8":
+            lldpData["remotePortDesc"] = string(variable.Value.([]byte))
+        }
+    }
+
+    return lldpData, nil
+}
+
+func getARPTable(ip, community string, version, port int) (map[string]string, error) {
+    snmp := gosnmp.GoSNMP{
+        Target:    ip,
+        Port:      uint16(port),
+        Community: community,
+        Version:   gosnmp.SnmpVersion(version),
+        Timeout:   2 * time.Second,
+    }
+
+    err := snmp.Connect()
+    if err != nil {
+        return nil, err
+    }
+    defer snmp.Conn.Close()
+
+    result, err := snmp.WalkAll("1.3.6.1.2.1.4.22.1")
+    if err != nil {
+        return nil, err
+    }
+
+    arpTable := make(map[string]string)
+    for _, variable := range result {
+        if strings.HasSuffix(variable.Name, ".1") { // IP Address
+            ipAddr := string(variable.Value.([]byte))
+            macAddr := ""
+            for _, v := range result {
+                if strings.HasPrefix(v.Name, strings.TrimSuffix(variable.Name, ".1")) && strings.HasSuffix(v.Name, ".2") {
+                    macAddr = string(v.Value.([]byte))
+                    break
+                }
+            }
+            arpTable[ipAddr] = macAddr
+        }
+    }
+
+    return arpTable, nil
+}
+
+func inferConnectionsFromARP(arpTable map[string]string) {
+    // Logika untuk menyimpulkan hubungan berdasarkan ARP
+    // Misalnya, perangkat dengan MAC address yang sama terhubung ke perangkat yang sama.
 }
