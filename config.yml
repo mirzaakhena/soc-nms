@@ -1,0 +1,8 @@
+networks:
+  - 192.168.1.0/24
+  - 10.0.0.0/24
+snmp:
+  community: public
+  version: 1  # 1 untuk SNMPv2c, 3 untuk SNMPv3
+  port: 161
+poll_interval: 60
