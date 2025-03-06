@@ -169,7 +169,20 @@ func discoverDevices(config Config, db *sql.DB) {
                     // Ambil informasi LLDP jika perangkat mendukung
                     lldpData, err := getLLDPInfo(ip, config.SNMP.Community, config.SNMP.Version, config.SNMP.Port)
                     if err == nil {
+                        log.Printf("LLDP data for %s: %+v", ip, lldpData)
+
                         saveTopologyToDB(db, ip, lldpData["remoteSystemName"], "", lldpData["remotePortDesc"])
+                    } else {
+                        log.Printf("Failed to get LLDP info for %s: %v", ip, err)
+
+                        // Jika LLDP tidak didukung, gunakan ARP
+                        arpTable, err := getARPTable(ip, config.SNMP.Community, config.SNMP.Version, config.SNMP.Port)
+                        if err == nil {
+                            log.Printf("ARP table for %s: %+v", ip, arpTable)
+                            inferConnectionsFromARP(db, arpTable)
+                        } else {
+                            log.Printf("Failed to get ARP table for %s: %v", ip, err)
+                        }
                     }
                 }
 
@@ -207,12 +220,9 @@ func main() {
     ticker := time.NewTicker(time.Duration(config.PollInterval) * time.Second)
     defer ticker.Stop()
 
-    for {
-        select {
-        case <-ticker.C:
-            discoverDevices(config, db)
-            fmt.Println("Discovery completed and saved to database.")
-        }
+    for range ticker.C {
+        discoverDevices(config, db)
+        fmt.Println("Discovery completed and saved to database.")
     }
 }
 
@@ -302,7 +312,31 @@ func getARPTable(ip, community string, version, port int) (map[string]string, er
     return arpTable, nil
 }
 
-func inferConnectionsFromARP(arpTable map[string]string) {
-    // Logika untuk menyimpulkan hubungan berdasarkan ARP
-    // Misalnya, perangkat dengan MAC address yang sama terhubung ke perangkat yang sama.
+func inferConnectionsFromARP(db *sql.DB, arpTable map[string]string) {
+    macToIPs := make(map[string][]string)
+
+    for ip, mac := range arpTable {
+        if mac != "" {
+            macToIPs[mac] = append(macToIPs[mac], ip)
+        }
+    }
+
+    for mac, ips := range macToIPs {
+        if len(ips) > 1 {
+            log.Printf("MAC: %s connects the following IPs: %v", mac, ips)
+            for i := 0; i < len(ips)-1; i++ {
+                localIP := ips[i]
+                remoteIP := ips[i+1]
+                log.Printf("Saving topology: localIP=%s, remoteIP=%s", localIP, remoteIP)
+                if err := saveTopologyToDB(db, localIP, remoteIP, "", ""); err != nil {
+                    log.Printf("Error saving topology for MAC %s: %v", mac, err)
+                }
+            }
+        } else if len(ips) == 1 {
+            log.Printf("MAC: %s connects to single IP: %s", mac, ips[0])
+            if err := saveTopologyToDB(db, ips[0], "", "", ""); err != nil {
+                log.Printf("Error saving topology for MAC %s: %v", mac, err)
+            }
+        }
+    }
 }
