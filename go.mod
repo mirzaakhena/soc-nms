@@ -4,6 +4,7 @@ go 1.24.0
 
 require (
 	github.com/gosnmp/gosnmp v1.39.0
+	github.com/huin/goupnp v1.3.0
 	github.com/mattn/go-sqlite3 v1.14.24
 	github.com/prometheus-community/pro-bing v0.6.1
 )
